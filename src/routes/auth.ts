@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
 import { methodNotAllowed } from '../middleware/methodNotAllowed';
 import { validateBody } from '../middleware/validate';
+import { enforceAuthLockout } from '../middleware/authFailureLockout';
 import config from '../config';
 import { extractAccount } from '../services/sep10';
 import { verifyJwt } from '../utils/jwt';
@@ -95,6 +96,7 @@ router.route('/token')
   .post(
     authIpRateLimit('token'),
     authAccountRateLimit('token', tokenAccountKey),
+    enforceAuthLockout,
     validateBody(tokenSchema),
     postToken,
   )

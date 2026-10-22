@@ -250,6 +250,80 @@ const corsAllowedOrigins =
     ? rawCorsOrigins.split(',').map((o) => o.trim()).filter(Boolean)
     : DEFAULT_CORS_ORIGINS[nodeEnv];
 
+/**
+ * Compile a wildcard CORS pattern entry (e.g. `https://*.scoutoff.app`) into
+ * an anchored regular expression that:
+ *   - matches the exact scheme (https:// only)
+ *   - matches exactly one subdomain label (letters, digits, hyphens) by default
+ *   - matches the exact host suffix and any optional port
+ *   - rejects look-alike and suffix-attack origins
+ *
+ * Returns null and logs a startup warning for unsafe or malformed patterns.
+ */
+function compileCorsPattern(pattern: string): RegExp | null {
+  // Only `https://` wildcard patterns are supported. Plain `*` is handled
+  // separately in app.ts (dev/test only).
+  const match = pattern.match(/^(https?:\/\/)\*\.(.+)$/);
+  if (!match) {
+    console.warn(
+      `[cors] WARNING: "${pattern}" is not a supported wildcard pattern and will be ignored. ` +
+      'Use "https://*.yourdomain.com" format.',
+    );
+    return null;
+  }
+
+  const [, scheme, suffix] = match;
+
+  // Only https:// patterns are safe to use with credentials
+  if (scheme !== 'https://') {
+    console.warn(
+      `[cors] WARNING: Wildcard CORS pattern "${pattern}" uses an insecure scheme. ` +
+      'Only https:// is allowed for wildcard patterns.',
+    );
+    return null;
+  }
+
+  // The suffix must contain at least two labels (e.g. "scoutoff.app", not "*.app")
+  // to prevent overly broad patterns that could match unrelated domains.
+  // Strip optional port suffix before counting labels.
+  const hostPart = suffix.split(':')[0];
+  const labels = hostPart.split('.').filter(Boolean);
+  if (labels.length < 2) {
+    console.warn(
+      `[cors] WARNING: Wildcard CORS pattern "${pattern}" is too broad (fewer than 2 ` +
+      'literal labels after the wildcard). Pattern rejected.',
+    );
+    return null;
+  }
+
+  // Escape the suffix for use in a regex: dots → \., rest is literal.
+  const escapedSuffix = suffix.replace(/\./g, '\\.').replace(/:/g, ':');
+
+  // Single-label wildcard: [a-z0-9-]+ (one subdomain label, no dots).
+  // This prevents multi-level wildcard matches (e.g. evil.pr-1.scoutoff.app)
+  // unless the pattern uses **.
+  const subdomainPattern = '[a-z0-9-]+';
+
+  return new RegExp(`^https://${subdomainPattern}\\.${escapedSuffix}$`, 'i');
+}
+
+/**
+ * Pre-compiled set of wildcard origin patterns parsed from CORS_ALLOWED_ORIGINS.
+ * Patterns are compiled once at startup and reused for every request.
+ */
+const corsWildcardPatterns: RegExp[] = corsAllowedOrigins
+  .filter((o) => o.includes('*') && o !== '*')
+  .map(compileCorsPattern)
+  .filter((r): r is RegExp => r !== null);
+
+// Warn if production/staging uses '*' (global wildcard) — this disables credentials
+if ((nodeEnv === 'production' || nodeEnv === 'staging') && corsAllowedOrigins.includes('*')) {
+  console.error(
+    '[cors] ERROR: CORS_ALLOWED_ORIGINS includes "*" in production/staging. ' +
+    'This disables credentials and is a security risk. Use explicit origins.',
+  );
+}
+
 // Validate NETWORK and derive networkPassphrase with defaults per network type.
 // Acceptable network values: 'testnet', 'mainnet', 'futurenet', 'standalone'.
 // Default passphrases follow Stellar's convention for each network type.
@@ -564,6 +638,7 @@ const config = {
   },
   corsAllowedOrigins,
   allowedOrigins: corsAllowedOrigins,
+  corsWildcardPatterns,
   logLevel: (process.env.LOG_LEVEL ?? ENV_LOG_LEVEL[nodeEnv]) as LogLevel,
   showErrorDetails: nodeEnv === 'development' || nodeEnv === 'test',
   useMockServices: nodeEnv === 'development' || nodeEnv === 'test',

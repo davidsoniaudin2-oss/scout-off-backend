@@ -82,6 +82,7 @@ async function probeDbWritable(timeoutMs = 2_000): Promise<'ok' | 'error'> {
 
 const isDevOrTest = config.nodeEnv === 'development' || config.nodeEnv === 'test';
 const allowedOrigins = config.corsAllowedOrigins;
+const wildcardPatterns = config.corsWildcardPatterns;
 
 if (!isDevOrTest && (!allowedOrigins || allowedOrigins.length === 0)) {
   logger.warn(
@@ -107,10 +108,22 @@ const corsOptions: CorsOptions = {
       return;
     }
 
-    // Explicit allowlist check (case-sensitive, exact match)
+    // Exact allowlist check (case-sensitive)
     if (allowedOrigins.includes(origin)) {
+      // Set Vary: Origin to ensure caches don't mix responses for different origins
       callback(null, origin);
       return;
+    }
+
+    // Wildcard subdomain pattern check: lowercase origin host for comparison.
+    // Scheme and port must match exactly (patterns are anchored regexes).
+    for (const pattern of wildcardPatterns) {
+      if (pattern.test(origin)) {
+        // Set Vary: Origin so CDN/proxy caches don't serve one origin's
+        // response to a request from a different origin.
+        callback(null, origin);
+        return;
+      }
     }
 
     // Not in the allowlist — suppress the CORS header (no error thrown so the
@@ -138,7 +151,7 @@ const corsOptions: CorsOptions = {
     'X-RateLimit-Reputation-Limit',
   ],
   // credentials cannot be used with a wildcard origin (CORS spec); only enable
-  // it when we are using an explicit allowlist
+  // it when we are using an explicit allowlist or wildcard pattern match
   credentials: !isWildcard,
   maxAge: 86400, // 24 hours — browsers cache pre-flight for this duration
   preflightContinue: false,
@@ -173,6 +186,20 @@ app.set('etag', false);
 // v8) rejects a bare '*' route — '/*splat' is the v8 catch-all form.
 app.options('/*splat', cors(corsOptions));
 app.use(cors(corsOptions));
+// Set Vary: Origin on any response that reflects a specific origin back to the
+// client, so shared caches (CDN, proxy) don't serve one origin's response
+// to requests from a different origin.
+app.use((_req, res, next) => {
+  if (!isWildcard) {
+    const vary = res.getHeader('Vary');
+    if (!vary) {
+      res.setHeader('Vary', 'Origin');
+    } else if (!String(vary).includes('Origin')) {
+      res.setHeader('Vary', `${vary}, Origin`);
+    }
+  }
+  next();
+});
 app.use(compression({
   threshold: config.compressionThresholdBytes,
   filter: (req, res) => {
