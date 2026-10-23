@@ -70,17 +70,18 @@ export async function resolveEffectiveRole(
       if (requestedRole === 'validator') return 'validator';
     }
   } catch (err) {
-    // Non-fatal: if the DB is unreachable, fall back to requested role.
-    // This is a graceful-degradation choice — an unavailable DB should not
-    // lock out all token refreshes.
-    logger.warn('[auth] resolveEffectiveRole: validator check failed, degrading to requestedRole', {
+    // Non-fatal: if the DB is unreachable, the refresh still succeeds but the
+    // validator role cannot be confirmed, so it is not granted. An unavailable
+    // DB should not lock out all token refreshes, nor extend unverified access.
+    logger.warn('[auth] resolveEffectiveRole: validator check failed, validator role not granted', {
       account,
       err: err instanceof Error ? err.message : String(err),
     });
   }
 
-  // Fallback: honour the requested scout/player role, defaulting to 'player'
-  const allowed = new Set(['scout', 'player', 'validator']);
+  // Fallback: honour the requested scout/player role, defaulting to 'player'.
+  // 'validator' is only ever granted by the verified check above.
+  const allowed = new Set(['scout', 'player']);
   return allowed.has(requestedRole ?? '') ? (requestedRole as string) : 'player';
 }
 
