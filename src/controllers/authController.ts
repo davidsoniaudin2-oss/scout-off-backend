@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, Transaction } from '@stellar/stellar-sdk';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
-import { buildChallenge, verifyChallenge, extractAccount } from '../services/sep10';
+import { buildChallenge, verifyChallenge, extractAccount, Sep10Error, Sep10ErrorCode, getErrorMapping } from '../services/sep10';
 import { logger } from '../utils/logger';
 import { extractClientIp } from '../utils/ipExtractor';
 import config from '../config';
@@ -13,8 +13,12 @@ import { signJwt, verifyJwt } from '../utils/jwt';
 import { getValidatorByWallet } from '../services/indexer';
 import { insertAuditLog } from '../db';
 import { recordAuthFailure, resetAuthFailures } from '../middleware/authFailureLockout';
+import { incAuthFailure } from '../middleware/metrics';
 
 // ─── Schema ────────────────────────────────────────────────────────────────────
+
+/** Roles a refresh token may legitimately carry. */
+const VALID_ROLES = new Set(['player', 'scout', 'validator', 'admin']);
 
 const challengeSchema = z.object({
   account: z.string().refine(
@@ -116,7 +120,7 @@ function issueRefreshToken(account: string, role: string): { token: string; jti:
 // ─── GET /auth/challenge ───────────────────────────────────────────────────────
 
 /** GET /auth/challenge?account=G... */
-export function getChallenge(req: Request, res: Response, next: NextFunction): void {
+export function getChallenge(req: Request, res: Response, _next: NextFunction): void {
   const parsed = challengeSchema.safeParse(req.query);
   if (!parsed.success) {
     logger.warn('[auth] failed_challenge_request', {
@@ -129,7 +133,12 @@ export function getChallenge(req: Request, res: Response, next: NextFunction): v
     return;
   }
   const challenge = buildChallenge(parsed.data.account);
-  res.json({ challenge, networkPassphrase: config.networkPassphrase });
+  const challengeTransaction = new Transaction(challenge, config.networkPassphrase);
+  const expiresAt = Number(challengeTransaction.timeBounds?.maxTime);
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+    throw new Error('Generated SEP-10 challenge has no valid expiration time');
+  }
+  res.json({ challenge, networkPassphrase: config.networkPassphrase, expiresAt });
 }
 
 // ─── POST /auth/token ──────────────────────────────────────────────────────────
@@ -166,67 +175,40 @@ try {
     // Step 4: reset any per-account failure counter on successful exchange.
     void resetAuthFailures(account);
 
-    res.json({ token: accessToken, accessToken, refreshToken, account, expiresAt });
+    res.json({ success: true, token: accessToken, accessToken, refreshToken, account, expiresAt });
   } catch (err) {
-    // Normalise to Error — the SDK can throw DOMException (from the base64
-    // decoder) or XdrError which, in some JS environments (e.g. Jest's vm
-    // sandbox), may not satisfy `instanceof Error` even though they are
-    // error-like objects.  Convert to a plain Error so the rest of the
-    // handler can treat everything uniformly.
-    const error: Error = err instanceof Error
-      ? err
-      : new Error(String((err as { message?: string })?.message ?? err));
-    {
-      const knownAuthErrors = [
-        'Invalid challenge signature',
-        'Missing source account in challenge',
-        'Challenge has expired',
-        'Challenge source account is not the server account',
-        'Challenge sequence number must be 0',
-        'Challenge must have time bounds',
-        'Challenge minTime is in the future',
-        'Invalid challenge: no operations found',
-        'Invalid challenge: expected manageData operation',
-        'Invalid challenge: operation',
-        'Invalid challenge: wrong operation name',
-        'Invalid challenge: missing nonce value',
-        'Invalid challenge: nonce must be exactly 64 bytes',
-        'Operation',
-        'must be sourced by the server account',
-        'Challenge not signed by server',
-      ];
-      if (knownAuthErrors.some((msg) => error.message.includes(msg))) {
-        let attemptedWallet: string | null = null;
-        try { attemptedWallet = extractAccount((req.body as { transaction?: string }).transaction ?? ''); } catch { /* not extractable */ }
-        logger.warn('[auth] failed_token_exchange', {
-          correlationId: req.correlationId,
-          origin: extractClientIp(req),
-          attemptedWallet,
-          reason: error.message,
-        });
-        // Record the failure for per-account backoff tracking
-        if (attemptedWallet) {
-          void recordAuthFailure(
-            attemptedWallet,
-            extractClientIp(req) ?? 'unknown',
-            req.correlationId,
-          );
-        }
-        res.status(401).json({
-          success: false,
-          error: error.message,
-          code: error.message === 'Challenge has expired' ? ErrorCode.TOKEN_EXPIRED : ErrorCode.TOKEN_INVALID,
-        });
-        return;
-      }
-      logger.warn('[auth] failed_token_request malformed_xdr', {
+    // Sep10Error is thrown by verifyChallenge for authentication failures
+    // or malformed XDR. Map to HTTP status and ErrorCode.
+    if (err instanceof Sep10Error) {
+      const mapping = getErrorMapping(err.code);
+      let attemptedWallet: string | null = null;
+      try { attemptedWallet = extractAccount((req.body as { transaction?: string }).transaction ?? ''); } catch { /* not extractable */ }
+      logger.warn('[auth] failed_token_exchange', {
         correlationId: req.correlationId,
         origin: extractClientIp(req),
-        reason: error.message,
+        attemptedWallet,
+        sep10ErrorCode: err.code,
+        reason: err.message,
       });
-      res.status(400).json({ success: false, error: error.message, code: ErrorCode.VALIDATION_ERROR });
+      if (mapping.httpStatus === 401) incAuthFailure('sep10_invalid');
+      // Record the failure for per-account backoff tracking
+      if (mapping.httpStatus === 401 && attemptedWallet) {
+        void recordAuthFailure(
+          attemptedWallet,
+          extractClientIp(req) ?? 'unknown',
+          req.correlationId,
+        );
+      }
+      res.status(mapping.httpStatus).json({
+        success: false,
+        error: mapping.clientMessage,
+        code: mapping.errorCode as ErrorCode,
+      });
       return;
     }
+
+    // Any other error should be passed to the error handler (500 via errorHandler)
+    next(err);
   }
 }
 
@@ -280,7 +262,14 @@ try {
     const account = payload.sub;
     const role = payload.role as string | undefined;
 
-    if (!jti || !account) {
+    // Every refresh token we issue carries a known role; one without it is
+    // malformed and must not be silently upgraded to a fresh session.
+    if (!jti || !account || typeof role !== 'string' || !VALID_ROLES.has(role)) {
+      logger.warn('[auth] refresh_token_malformed', {
+        jti,
+        hasSub: Boolean(account),
+        role: typeof role === 'string' ? role : undefined,
+      });
       res.status(401).json({
         success: false,
         error: 'Malformed refresh token',
